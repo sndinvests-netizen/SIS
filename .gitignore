@@ -7,3 +7,4 @@ build/
 .venv/
 venv/
 copy_output_*.md
+session_*.json

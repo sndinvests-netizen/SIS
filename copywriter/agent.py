@@ -1,6 +1,8 @@
 """
 Standalone copywriter agent using the Anthropic SDK.
 Mirrors the oJoy.ai workflow: Discovery → Strategy → Voice → Draft → Formats
+
+Uses prompt caching on system prompts to reduce API costs on long sessions.
 """
 
 import os
@@ -53,13 +55,19 @@ def _wrap(text: str, width: int = 70) -> str:
     )
 
 
+def _cached_system(prompt: str) -> list[dict]:
+    """Wrap a system prompt string for prompt caching."""
+    return [{"type": "text", "text": prompt, "cache_control": {"type": "ephemeral"}}]
+
+
 class CopywriterAgent:
     def __init__(self, model: str = "claude-opus-4-8"):
         api_key = os.environ.get("ANTHROPIC_API_KEY")
         if not api_key:
             raise EnvironmentError(
                 "ANTHROPIC_API_KEY environment variable is not set.\n"
-                "Copy .env.example to .env and add your key."
+                "Copy .env.example to .env and add your key.\n"
+                "Get one at: https://console.anthropic.com/"
             )
         self.client = anthropic.Anthropic(api_key=api_key)
         self.model = model
@@ -85,12 +93,41 @@ class CopywriterAgent:
         response = self.client.messages.create(
             model=self.model,
             max_tokens=max_tokens,
-            system=system,
+            system=_cached_system(system),
             messages=history,
         )
         reply = response.content[0].text
         history.append({"role": "assistant", "content": reply})
         return reply
+
+    # ------------------------------------------------------------------ #
+    # Session save / load
+    # ------------------------------------------------------------------ #
+
+    def save_session(self) -> str:
+        """Save current progress to a JSON file so it can be resumed later."""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"session_{timestamp}.json"
+        state = {
+            "saved_at": datetime.now().isoformat(),
+            "discovery": self.discovery,
+            "strategy": self.strategy,
+            "master_copy": self.master_copy,
+        }
+        with open(filename, "w") as f:
+            json.dump(state, f, indent=2)
+        print(f"\nSession saved to: {filename}")
+        return filename
+
+    def load_session(self, filename: str) -> None:
+        """Restore a previously saved session."""
+        with open(filename) as f:
+            state = json.load(f)
+        self.discovery = state.get("discovery", {})
+        self.strategy = state.get("strategy", "")
+        self.master_copy = state.get("master_copy", "")
+        saved_at = state.get("saved_at", "unknown")
+        print(f"\nSession restored from: {filename} (saved {saved_at})")
 
     # ------------------------------------------------------------------ #
     # Phase 1 — Discovery
@@ -192,7 +229,6 @@ class CopywriterAgent:
         print(_hr())
         print("Writing your master copy...\n")
 
-        # Seed the draft history with the finalized strategy
         self._draft_history.append(
             {"role": "assistant", "content": self.strategy}
         )
@@ -215,7 +251,9 @@ class CopywriterAgent:
                 f"\n\nAdapt the writing to match this voice and style:\n\n{voice_samples}"
             )
 
-        master = self._call(self._draft_history, instruction, SYSTEM_PROMPT, max_tokens=8096)
+        master = self._call(
+            self._draft_history, instruction, SYSTEM_PROMPT, max_tokens=8096
+        )
         print(_wrap(master))
         self.master_copy = master
         return master
@@ -252,7 +290,7 @@ class CopywriterAgent:
         return output
 
     # ------------------------------------------------------------------ #
-    # Save output
+    # Save final output
     # ------------------------------------------------------------------ #
 
     def save_output(self, formats_output: str) -> str:
@@ -286,21 +324,46 @@ class CopywriterAgent:
     # Main run loop
     # ------------------------------------------------------------------ #
 
-    def run(self) -> None:
+    def run(self, resume_from: str | None = None, formats_only: bool = False) -> None:
         print(f"\n{_hr()}")
         print("  COPYWRITER AGENT — Direct Response AI")
         print("  Powered by Anthropic Claude")
         print(_hr())
-        print(
-            "\nThis agent will interview you, define a strategy, write master\n"
-            "copy, then generate every ad format you need.\n"
-        )
 
-        self.run_discovery()
-        self.run_strategy()
+        if resume_from:
+            self.load_session(resume_from)
+            if formats_only:
+                # Skip straight to format generation
+                formats_output = self.run_formats()
+                save = input("\nSave to file? (y/n): ").strip().lower()
+                if save == "y":
+                    self.save_output(formats_output)
+                return
 
-        voice = self.get_voice_samples()
-        self.run_draft(voice)
+            # Resume from whichever phase has missing data
+            if not self.discovery:
+                self.run_discovery()
+            if not self.strategy:
+                self.run_strategy()
+            voice = self.get_voice_samples()
+            if not self.master_copy:
+                self.run_draft(voice)
+        else:
+            print(
+                "\nThis agent will interview you, define a strategy, write master\n"
+                "copy, then generate every ad format you need.\n"
+            )
+            self.run_discovery()
+            self.run_strategy()
+            voice = self.get_voice_samples()
+            self.run_draft(voice)
+
+        # Offer mid-run session save before the expensive formats call
+        checkpoint = input(
+            "\nSave session checkpoint before generating formats? (y/n): "
+        ).strip().lower()
+        if checkpoint == "y":
+            self.save_session()
 
         formats_output = self.run_formats()
 
